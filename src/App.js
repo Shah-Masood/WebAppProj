@@ -1,252 +1,226 @@
 import React, { useEffect, useRef, useState } from "react";
-import { FaceLandmarker, FilesetResolver, DrawingUtils } from "@mediapipe/tasks-vision";
+import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
 
 export default function App() {
   const videoRef = useRef(null);
-  const canvasRef = useRef(null);
-  const streamRef = useRef(null);
-
-  const faceLandmarkerRef = useRef(null);
+  const overlayRef = useRef(null);
+  const detectorRef = useRef(null);
   const rafRef = useRef(null);
   const lastVideoTimeRef = useRef(-1);
 
-  const [status, setStatus] = useState("Ready");
-  const [running, setRunning] = useState(false);
+  const [status, setStatus] = useState("Stopped");
   const [faces, setFaces] = useState(0);
+  const [debug, setDebug] = useState("");
 
+  // 1) Load the detector once on mount
   useEffect(() => {
-    // Cleanup on unmount
+    let cancelled = false;
+
+    async function initDetector() {
+      try {
+        setDebug("Loading face detector…");
+
+        const vision = await FilesetResolver.forVisionTasks(
+          // CDN hosts the wasm; easiest for CRA/Amplify
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+
+        const detector = await FaceDetector.createFromOptions(vision, {
+          baseOptions: {
+            // Short-range face detector model
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+          },
+          runningMode: "VIDEO",
+        });
+
+        if (cancelled) return;
+        detectorRef.current = detector;
+        setDebug("Detector loaded ✅");
+      } catch (e) {
+        console.error(e);
+        setDebug(`Detector load failed: ${e?.message || String(e)}`);
+      }
+    }
+
+    initDetector();
+
     return () => {
-      stop();
+      cancelled = true;
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      try {
+        detectorRef.current?.close?.();
+      } catch {}
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function initFaceLandmarker() {
-    if (faceLandmarkerRef.current) return faceLandmarkerRef.current;
-
-    setStatus("Loading face model...");
-
-    // Loads the WASM + assets for MediaPipe Tasks (hosted CDN)
-    const vision = await FilesetResolver.forVisionTasks(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
-    );
-
-    const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        // Model hosted on CDN (no backend)
-        modelAssetPath:
-          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-        delegate: "GPU", // will fall back if not available
-      },
-      runningMode: "VIDEO",
-      numFaces: 1,
-      outputFaceBlendshapes: false,
-      outputFacialTransformationMatrixes: false,
-    });
-
-    faceLandmarkerRef.current = faceLandmarker;
-    setStatus("Model loaded");
-    return faceLandmarker;
-  }
-
-  async function start() {
+  // 2) Start camera
+  async function startCamera() {
     try {
-      setStatus("Requesting camera...");
+      setStatus("Starting camera…");
+      setDebug("Requesting camera permission…");
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "user",
-          width: { ideal: 720 },
-          height: { ideal: 720 },
-        },
+        video: { facingMode: "user" },
         audio: false,
       });
-
-      streamRef.current = stream;
 
       const video = videoRef.current;
       video.srcObject = stream;
 
-      // On iOS Safari you need these
-      video.playsInline = true;
-      video.muted = true;
-
-      // Wait for metadata then play
-      await new Promise((res) => {
-        video.onloadedmetadata = () => res();
+      // Wait for metadata so videoWidth/videoHeight are valid
+      await new Promise((resolve) => {
+        video.onloadedmetadata = () => resolve();
       });
 
-      // Try play once; ignore interruption warnings
-      try {
-        await video.play();
-      } catch (_) {}
-
-      // Init model
-      await initFaceLandmarker();
-
-      setRunning(true);
-      setStatus("Detecting...");
-      loop();
+      await video.play();
+      setDebug(`Video ready ✅ (${video.videoWidth}x${video.videoHeight})`);
+      setStatus("Running");
+      runDetectionLoop();
     } catch (e) {
       console.error(e);
-      setStatus("Camera blocked or unavailable");
-      setRunning(false);
+      setStatus("Stopped");
+      setDebug(`Camera failed: ${e?.message || String(e)}`);
     }
   }
 
-  function stop() {
-    setRunning(false);
-    setFaces(0);
+  function stopAll() {
     setStatus("Stopped");
+    setFaces(0);
 
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    rafRef.current = null;
-    lastVideoTimeRef.current = -1;
-
-    if (streamRef.current) {
-      for (const track of streamRef.current.getTracks()) track.stop();
-      streamRef.current = null;
-    }
 
     const video = videoRef.current;
+    const stream = video?.srcObject;
+    if (stream && stream.getTracks) {
+      stream.getTracks().forEach((t) => t.stop());
+    }
     if (video) video.srcObject = null;
 
-    const canvas = canvasRef.current;
-    if (canvas) {
-      const ctx = canvas.getContext("2d");
-      ctx && ctx.clearRect(0, 0, canvas.width, canvas.height);
-    }
+    setDebug("Stopped.");
   }
 
-  function loop() {
+  // 3) Detection loop
+  function runDetectionLoop() {
+    const detector = detectorRef.current;
     const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const faceLandmarker = faceLandmarkerRef.current;
 
-    if (!video || !canvas || !faceLandmarker) return;
-    if (!running) return;
+    if (!detector) {
+      setDebug("Detector not loaded yet (wait 1–2s)...");
+      setStatus("Stopped");
+      return;
+    }
+    if (!video) return;
+
+    const step = () => {
+      // Only run when video has advanced
+      if (video.readyState >= 2 && video.currentTime !== lastVideoTimeRef.current) {
+        lastVideoTimeRef.current = video.currentTime;
+
+        const nowMs = performance.now();
+        const result = detector.detectForVideo(video, nowMs);
+
+        const detections = result?.detections || [];
+        setFaces(detections.length);
+
+        drawBoxes(detections);
+      }
+      rafRef.current = requestAnimationFrame(step);
+    };
+
+    rafRef.current = requestAnimationFrame(step);
+  }
+
+  function drawBoxes(detections) {
+    const canvas = overlayRef.current;
+    const video = videoRef.current;
+    if (!canvas || !video) return;
+
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (!w || !h) return;
+
+    canvas.width = w;
+    canvas.height = h;
 
     const ctx = canvas.getContext("2d");
-    const drawingUtils = new DrawingUtils(ctx);
+    ctx.clearRect(0, 0, w, h);
 
-    // Match canvas to video
-    const vw = video.videoWidth || 720;
-    const vh = video.videoHeight || 720;
-    if (canvas.width !== vw) canvas.width = vw;
-    if (canvas.height !== vh) canvas.height = vh;
+    // Draw each bounding box
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "#00ff00";
+    ctx.font = "18px Arial";
+    ctx.fillStyle = "#00ff00";
 
-    const nowInMs = performance.now();
-
-    // Only run detection when the video has advanced
-    if (video.currentTime !== lastVideoTimeRef.current) {
-      lastVideoTimeRef.current = video.currentTime;
-
-      const result = faceLandmarker.detectForVideo(video, nowInMs);
-
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      const detected = result?.faceLandmarks?.length || 0;
-      setFaces(detected);
-
-      if (detected > 0) {
-        // draw mesh connections (face oval + lips + eyes + etc)
-        for (const landmarks of result.faceLandmarks) {
-          drawingUtils.drawConnectors(
-            landmarks,
-            FaceLandmarker.FACE_LANDMARKS_TESSELATION,
-            { lineWidth: 1 }
-          );
-          drawingUtils.drawConnectors(
-            landmarks,
-            FaceLandmarker.FACE_LANDMARKS_FACE_OVAL,
-            { lineWidth: 2 }
-          );
-          drawingUtils.drawConnectors(
-            landmarks,
-            FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
-            { lineWidth: 2 }
-          );
-          drawingUtils.drawConnectors(
-            landmarks,
-            FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
-            { lineWidth: 2 }
-          );
-          drawingUtils.drawConnectors(
-            landmarks,
-            FaceLandmarker.FACE_LANDMARKS_LIPS,
-            { lineWidth: 2 }
-          );
-        }
-      }
-    }
-
-    rafRef.current = requestAnimationFrame(loop);
+    detections.forEach((d, i) => {
+      const box = d.boundingBox;
+      if (!box) return;
+      ctx.strokeRect(box.originX, box.originY, box.width, box.height);
+      ctx.fillText(`Face ${i + 1}`, box.originX + 6, box.originY - 8);
+    });
   }
 
   return (
-    <div style={{ padding: 16, fontFamily: "system-ui, Arial" }}>
+    <div style={{ padding: 16, fontFamily: "Arial, sans-serif" }}>
       <h1 style={{ marginTop: 0 }}>SkinScan (MVP)</h1>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
-        {!running ? (
-          <button onClick={start} style={{ padding: "10px 14px" }}>
-            Start Scan
-          </button>
-        ) : (
-          <button onClick={stop} style={{ padding: "10px 14px" }}>
-            Stop
-          </button>
-        )}
+      <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+        <button onClick={startCamera} style={{ padding: "10px 14px" }}>
+          Start Scan
+        </button>
+        <button onClick={stopAll} style={{ padding: "10px 14px" }}>
+          Stop
+        </button>
 
         <div>
-          <div style={{ fontSize: 14 }}>
+          <div>
             <b>Status:</b> {status}
           </div>
-          <div style={{ fontSize: 14 }}>
+          <div>
             <b>Faces:</b> {faces}
           </div>
         </div>
       </div>
 
-      {/* Camera + overlay */}
-      <div
-        style={{
-          position: "relative",
-          width: "100%",
-          maxWidth: 520,
-          aspectRatio: "1 / 1",
-          borderRadius: 18,
-          overflow: "hidden",
-          background: "#000",
-        }}
-      >
+      <div style={{ marginTop: 16, position: "relative", maxWidth: 520 }}>
         <video
           ref={videoRef}
+          playsInline
+          muted
           style={{
-            position: "absolute",
-            inset: 0,
             width: "100%",
-            height: "100%",
-            objectFit: "cover",
-            transform: "scaleX(-1)", // mirror for selfie mode
+            borderRadius: 18,
+            background: "#000",
           }}
         />
         <canvas
-          ref={canvasRef}
+          ref={overlayRef}
           style={{
             position: "absolute",
-            inset: 0,
+            left: 0,
+            top: 0,
             width: "100%",
             height: "100%",
             pointerEvents: "none",
-            transform: "scaleX(-1)", // mirror overlay to match video
           }}
         />
       </div>
 
-      <p style={{ marginTop: 12, color: "#666" }}>
-        Tip: bright, even lighting. Avoid backlight.
+      <p style={{ color: "#666", marginTop: 12 }}>
+        Tip: Use bright, even lighting. Avoid backlight.
       </p>
+
+      <pre
+        style={{
+          background: "#f5f5f5",
+          padding: 10,
+          borderRadius: 10,
+          fontSize: 12,
+          overflowX: "auto",
+        }}
+      >
+        {debug}
+      </pre>
     </div>
   );
 }
