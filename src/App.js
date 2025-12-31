@@ -1,6 +1,25 @@
 import React, { useEffect, useRef, useState } from "react";
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
+async function testLambda() {
+  try {
+    const url = process.env.REACT_APP_LAMBDA_URL;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from: "react", ts: Date.now() }),
+    });
+
+    const data = await res.json();
+    console.log("Lambda response:", data);
+    alert("Lambda says: " + JSON.stringify(data));
+  } catch (e) {
+    console.error(e);
+    alert("Request failed: " + e.message);
+  }
+}
+
 export default function App() {
   const videoRef = useRef(null);
   const overlayRef = useRef(null);
@@ -12,6 +31,11 @@ export default function App() {
   const [faces, setFaces] = useState(0);
   const [debug, setDebug] = useState("");
   const [scores, setScores] = useState({ lighting: 0, redness: 0, shine: 0 });
+
+  <button onClick={testLambda}>
+  Test Lambda
+  </button>
+
 
   // 1) Load the FaceLandmarker once on mount
   useEffect(() => {
@@ -445,4 +469,3 @@ function pointInPoly(pt, poly) {
 function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
-
