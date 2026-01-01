@@ -47,6 +47,10 @@ export default function App() {
   Test Lambda
   </button>
 
+  <button onClick={callML}>
+  Test ML Lambda
+  </button>
+
 
   // 1) Load the FaceLandmarker once on mount
   useEffect(() => {
@@ -481,3 +485,4 @@ function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 
 }
+
