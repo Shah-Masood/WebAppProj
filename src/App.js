@@ -20,6 +20,17 @@ async function testLambda() {
   }
 }
 
+const ML_URL = process.env.REACT_APP_ML_URL;
+
+export async function analyzeSkin(payload) {
+  const res = await fetch(ML_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return await res.json();
+}
+
 export default function App() {
   const videoRef = useRef(null);
   const overlayRef = useRef(null);
@@ -468,4 +479,5 @@ function pointInPoly(pt, poly) {
 
 function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
+
 }
