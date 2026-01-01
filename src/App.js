@@ -1,40 +1,60 @@
-import React, { useEffect, useRef, useState } from "react";
-import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { FaceLandmarker, FilesetResolver, DrawingUtils } from "@mediapipe/tasks-vision";
+import "./App.css";
 
-/**
- * App expects:
- *   - Amplify env var: REACT_APP_ML_URL = https://xxxx.lambda-url.us-east-1.on.aws/
- *
- * Lambda request payload (JSON):
- *   { image_b64: "data:image/jpeg;base64,....", ts: <number> }
- *
- * Lambda response expected (example):
- *   { ok: true, acne: 1, redness: 0, dryness: 2 }
- */
+const LIGHTING_OK_THRESHOLD = 55; // tweak to taste
+const AUTO_CALL_MS = 2500;
+
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function stripDataUrlHeader(dataUrl) {
+  // "data:image/jpeg;base64,AAAA..." -> "AAAA..."
+  if (!dataUrl) return "";
+  const idx = dataUrl.indexOf(",");
+  return idx >= 0 ? dataUrl.slice(idx + 1) : dataUrl;
+}
+
+function Card({ title, value, sub }) {
+  return (
+    <div className="card">
+      <div className="cardTitle">{title}</div>
+      <div className="cardValue">{value}</div>
+      <div className="cardSub">{sub}</div>
+    </div>
+  );
+}
 
 export default function App() {
   const videoRef = useRef(null);
   const overlayRef = useRef(null);
+
   const landmarkerRef = useRef(null);
   const rafRef = useRef(null);
-  const lastVideoTimeRef = useRef(-1);
+  const lastAutoCallRef = useRef(0);
 
-  // throttle inference
-  const inFlightRef = useRef(false);
-  const lastInferMsRef = useRef(0);
-
-  const [status, setStatus] = useState("Stopped");
+  const [running, setRunning] = useState(false);
   const [faces, setFaces] = useState(0);
-  const [debug, setDebug] = useState("");
-  const [scores, setScores] = useState({ lighting: 0, redness: 0, shine: 0 });
+  const [lighting, setLighting] = useState(0);
 
-  const [mlStatus, setMlStatus] = useState("Idle");
+  // ML states
+  const [mlWired, setMlWired] = useState(false);
+  const [mlStatus, setMlStatus] = useState("Idle"); // Idle | Running | Done | Failed
   const [mlError, setMlError] = useState("");
-  const [mlResult, setMlResult] = useState(null);
 
-  const ML_URL = process.env.REACT_APP_ML_URL;
+  const [acneValue, setAcneValue] = useState("—");
+  const [drynessValue, setDrynessValue] = useState("—");
+  const [mlRednessValue, setMlRednessValue] = useState("—");
 
-  // 1) Load the FaceLandmarker once on mount
+  const [debug, setDebug] = useState("");
+
+  const ML_URL = useMemo(() => {
+    const raw = process.env.REACT_APP_ML_URL || process.env.REACT_APP_LAMBDA_URL || "";
+    return raw.trim();
+  }, []);
+
+  // Load FaceLandmarker once
   useEffect(() => {
     let cancelled = false;
 
@@ -71,57 +91,56 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
       try {
         landmarkerRef.current?.close?.();
       } catch {}
+      landmarkerRef.current = null;
     };
   }, []);
 
-  // 2) Start camera
-  async function startCamera() {
-    try {
-      setStatus("Starting camera…");
-      setDebug("Requesting camera permission…");
+  // Start camera
+  async function startScan() {
+    setMlError("");
+    setMlStatus("Running");
+    setRunning(true);
 
+    try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user" },
         audio: false,
       });
 
-      const video = videoRef.current;
-      video.srcObject = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
 
-      await new Promise((resolve) => {
-        video.onloadedmetadata = () => resolve();
-      });
-
-      await video.play();
-      setDebug(`Video ready ✅ (${video.videoWidth}x${video.videoHeight})`);
-      setStatus("Running");
-      runLoop();
+      // kick loop
+      loop();
     } catch (e) {
       console.error(e);
-      setStatus("Stopped");
-      setDebug(`Camera failed: ${e?.message || String(e)}`);
+      setRunning(false);
+      setMlStatus("Failed");
+      setMlError(`Camera error: ${e?.message || String(e)}`);
     }
   }
 
-  function stopAll() {
-    setStatus("Stopped");
-    setFaces(0);
-    setScores({ lighting: 0, redness: 0, shine: 0 });
-
+  // Stop camera
+  function stopScan() {
+    setRunning(false);
     setMlStatus("Idle");
-    setMlError("");
-    setMlResult(null);
 
+    // stop raf
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
 
-    const video = videoRef.current;
-    const stream = video?.srcObject;
-    if (stream && stream.getTracks) stream.getTracks().forEach((t) => t.stop());
-    if (video) video.srcObject = null;
+    // stop stream
+    const v = videoRef.current;
+    const stream = v?.srcObject;
+    if (stream && stream.getTracks) {
+      stream.getTracks().forEach((t) => t.stop());
+    }
+    if (v) v.srcObject = null;
 
     // clear overlay
     const canvas = overlayRef.current;
@@ -129,514 +148,243 @@ export default function App() {
       const ctx = canvas.getContext("2d");
       ctx.clearRect(0, 0, canvas.width, canvas.height);
     }
-
-    setDebug("Stopped.");
   }
 
-  // 3) Main loop
-  function runLoop() {
-    const landmarker = landmarkerRef.current;
-    const video = videoRef.current;
+  function computeLightingFromVideoFrame(videoEl) {
+    // sample a small downscaled frame for brightness
+    const tmp = document.createElement("canvas");
+    const w = 64;
+    const h = 48;
+    tmp.width = w;
+    tmp.height = h;
 
-    if (!landmarker) {
-      setDebug("FaceLandmarker not loaded yet (wait 1–2s)...");
-      setStatus("Stopped");
+    const ctx = tmp.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(videoEl, 0, 0, w, h);
+    const img = ctx.getImageData(0, 0, w, h).data;
+
+    let sum = 0;
+    for (let i = 0; i < img.length; i += 4) {
+      // luminance approx
+      sum += 0.2126 * img[i] + 0.7152 * img[i + 1] + 0.0722 * img[i + 2];
+    }
+    const avg = sum / (img.length / 4);
+    return Math.round(avg);
+  }
+
+  function drawNoseCheekGuides(ctx, w, h, landmarks) {
+    // Simple green guide triangles near cheeks based on a few landmark points.
+    // (This is lightweight “guide overlay”, not a medical thing.)
+    // Indices are from MediaPipe face landmark topology.
+    const leftCheek = landmarks[234];  // approx left cheek
+    const rightCheek = landmarks[454]; // approx right cheek
+    const noseTip = landmarks[1];      // approx nose tip
+
+    if (!leftCheek || !rightCheek || !noseTip) return;
+
+    ctx.save();
+    ctx.globalAlpha = 0.6;
+    ctx.fillStyle = "rgb(0, 255, 0)";
+
+    const lx = leftCheek.x * w, ly = leftCheek.y * h;
+    const rx = rightCheek.x * w, ry = rightCheek.y * h;
+    const nx = noseTip.x * w, ny = noseTip.y * h;
+
+    // left triangle
+    ctx.beginPath();
+    ctx.moveTo(nx, ny);
+    ctx.lineTo(lx, ly);
+    ctx.lineTo(lx, ly + 40);
+    ctx.closePath();
+    ctx.fill();
+
+    // right triangle
+    ctx.beginPath();
+    ctx.moveTo(nx, ny);
+    ctx.lineTo(rx, ry);
+    ctx.lineTo(rx, ry + 40);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  async function callLambdaWithCurrentFrame() {
+    if (!ML_URL) {
+      setMlStatus("Failed");
+      setMlError("Missing REACT_APP_ML_URL env var (Amplify environment variables).");
       return;
     }
-    if (!video) return;
 
-    const step = () => {
-      if (video.readyState >= 2 && video.currentTime !== lastVideoTimeRef.current) {
-        lastVideoTimeRef.current = video.currentTime;
+    const videoEl = videoRef.current;
+    if (!videoEl) return;
 
-        const nowMs = performance.now();
-        const result = landmarker.detectForVideo(video, nowMs);
-
-        const landmarks = result?.faceLandmarks || [];
-        setFaces(landmarks.length);
-
-        if (landmarks.length > 0) {
-          // compute / draw + update scores
-          const computed = drawAndScore(landmarks[0]); // returns {lighting, redness, shine, lightingOk}
-          // auto-infer if lighting OK
-          if (computed?.lightingOk) {
-            maybeInferFromFrame();
-          }
-        } else {
-          clearOverlay();
-          setScores({ lighting: 0, redness: 0, shine: 0 });
-        }
-      }
-      rafRef.current = requestAnimationFrame(step);
-    };
-
-    rafRef.current = requestAnimationFrame(step);
-  }
-
-  function clearOverlay() {
-    const canvas = overlayRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    // draw current frame into a canvas and send
+    const canvas = document.createElement("canvas");
+    canvas.width = videoEl.videoWidth || 640;
+    canvas.height = videoEl.videoHeight || 480;
     const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-  }
+    ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
 
-  function drawAndScore(lm) {
-    const canvas = overlayRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return null;
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+    const image_b64 = stripDataUrlHeader(dataUrl);
 
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    if (!w || !h) return null;
-
-    canvas.width = w;
-    canvas.height = h;
-
-    const ctx = canvas.getContext("2d", { willReadFrequently: true });
-    ctx.clearRect(0, 0, w, h);
-
-    // Regions (simple, tweakable)
-    const leftCheek = polyFrom(lm, [50, 187, 205, 36, 142, 126, 100, 47], w, h);
-    const rightCheek = polyFrom(lm, [280, 411, 425, 266, 371, 355, 329, 277], w, h);
-    const nose = polyFrom(lm, [1, 2, 98, 327, 168], w, h);
-
-    // Draw ROI overlays
-    drawPoly(ctx, leftCheek, "rgba(0,255,0,0.20)");
-    drawPoly(ctx, rightCheek, "rgba(0,255,0,0.20)");
-    drawPoly(ctx, nose, "rgba(0,255,0,0.20)");
-
-    // Lighting (use cheeks combined)
-    const lighting = lightingQualityFromPolys(ctx, [leftCheek, rightCheek]);
-
-    let redness = 0;
-    let shine = 0;
-    const lightingOk = lighting >= 35;
-
-    if (lightingOk) {
-      redness = rednessFromPolys(ctx, [leftCheek, rightCheek]);
-      shine = shineFromPolys(ctx, [nose]);
-    }
-
-    // HUD
-    drawHUD(ctx, { lighting, redness, shine, lightingOk });
-
-    const out = {
-      lighting: Math.round(lighting),
-      redness: Math.round(redness),
-      shine: Math.round(shine),
-      lightingOk,
-    };
-
-    setScores({
-      lighting: out.lighting,
-      redness: out.redness,
-      shine: out.shine,
-    });
-
-    return out;
-  }
-
-  function captureFrameAsJpegDataUrl() {
-    const video = videoRef.current;
-    if (!video || !video.videoWidth || !video.videoHeight) return null;
-
-    const c = document.createElement("canvas");
-    c.width = video.videoWidth;
-    c.height = video.videoHeight;
-
-    const ctx = c.getContext("2d");
-    // IMPORTANT: video is mirrored for UX, but the actual pixels are not mirrored.
-    // If you want the model to see what user sees, you could mirror here.
-    ctx.drawImage(video, 0, 0, c.width, c.height);
-
-    return c.toDataURL("image/jpeg", 0.85);
-  }
-
-  async function callMlLambda(imageDataUrl) {
-    if (!ML_URL) {
-      throw new Error("Missing REACT_APP_ML_URL (Amplify env var).");
-    }
-
-    const res = await fetch(ML_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        image_b64: imageDataUrl,
-        ts: Date.now(),
-      }),
-    });
-
-    // helpful error text if Lambda returns non-2xx
-    const text = await res.text();
-    let json = null;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      // keep as text
-    }
-
-    if (!res.ok) {
-      const msg = json?.error || json?.message || text || `HTTP ${res.status}`;
-      throw new Error(msg);
-    }
-
-    return json ?? { raw: text };
-  }
-
-  async function runInferenceNow() {
     try {
       setMlError("");
-      setMlStatus("Capturing…");
-      const img = captureFrameAsJpegDataUrl();
-      if (!img) throw new Error("Camera not ready (no frame).");
+      setMlStatus("Running");
+      setMlWired(true);
 
-      setMlStatus("Inferring…");
-      const data = await callMlLambda(img);
-      if (!res.ok || data.ok === false) {
-        throw new Error(data.error || `Lambda failed (${res.status})`);
+      const res = await fetch(ML_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_b64 }),
+      });
+
+      const text = await res.text();
+      let payload;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = { ok: false, error: `Non-JSON response: ${text.slice(0, 120)}` };
       }
-      
-      // show acne numbers (binary model)
-      if (typeof data.acne_prob === "number") {
-        setAcne(Math.round(data.acne_prob * 100)); // e.g., 63
-      } else if (typeof data.acne_class === "number") {
-        setAcne(data.acne_class); // fallback for multiclass
-      } else {
-        setAcne(null);
+
+      if (!res.ok || payload?.ok === false) {
+        setMlStatus("Failed");
+        setMlError(payload?.error || `HTTP ${res.status}`);
+        return;
       }
-      
-      // you don't have these from the model yet, so keep them null/placeholder
-      setDryness(null);
-      setMlRedness(null);
-      
-      setMlStatus("done");
-      setMlError("");
-      setMlResult(data);
-      setMlStatus("Done ✅");
+
+      // ✅ YOUR RESPONSE: { ok: true, acne_class: 3 }
+      if (payload && typeof payload.acne_class !== "undefined") {
+        setAcneValue(String(payload.acne_class));
+      } else if (typeof payload.acne_prob !== "undefined") {
+        // if you switch back to binary later
+        setAcneValue(`${Math.round(payload.acne_prob * 100)}%`);
+      }
+
+      // placeholders until your backend returns these:
+      if (typeof payload.dryness !== "undefined") setDrynessValue(String(payload.dryness));
+      if (typeof payload.ml_redness !== "undefined") setMlRednessValue(String(payload.ml_redness));
+
+      setMlStatus("Done");
     } catch (e) {
       console.error(e);
-      setMlStatus("Failed ❌");
-      setMlError(e?.message || String(e));
+      setMlStatus("Failed");
+      setMlError(e?.message || "Failed to fetch");
     }
   }
 
-  function maybeInferFromFrame() {
-    // Don’t spam Lambda: 1 request every ~2.5s (tweak this)
-    const now = Date.now();
-    if (inFlightRef.current) return;
-    if (now - lastInferMsRef.current < 2500) return;
+  async function loop() {
+    if (!running) return;
 
-    // must be running, and must have URL
-    if (status !== "Running") return;
-    if (!ML_URL) return;
+    const videoEl = videoRef.current;
+    const canvas = overlayRef.current;
+    const landmarker = landmarkerRef.current;
 
-    const img = captureFrameAsJpegDataUrl();
-    if (!img) return;
+    if (videoEl && canvas && landmarker && videoEl.readyState >= 2) {
+      const w = videoEl.videoWidth;
+      const h = videoEl.videoHeight;
 
-    inFlightRef.current = true;
-    lastInferMsRef.current = now;
+      // fit overlay
+      canvas.width = w;
+      canvas.height = h;
 
-    setMlError("");
-    setMlStatus("Inferring…");
+      // update lighting
+      const light = computeLightingFromVideoFrame(videoEl);
+      setLighting(light);
 
-    callMlLambda(img)
-      .then((data) => {
-        setMlResult(data);
-        setMlStatus("Live ✅");
-      })
-      .catch((e) => {
-        setMlStatus("Live error ❌");
-        setMlError(e?.message || String(e));
-      })
-      .finally(() => {
-        inFlightRef.current = false;
-      });
+      // detect face landmarks
+      const nowMs = performance.now();
+      const res = landmarker.detectForVideo(videoEl, nowMs);
+
+      const numFaces = res?.faceLandmarks?.length || 0;
+      setFaces(numFaces);
+
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, w, h);
+
+      if (numFaces > 0) {
+        const drawingUtils = new DrawingUtils(ctx);
+        // optional: draw a few connections
+        drawingUtils.drawLandmarks(res.faceLandmarks[0], {
+          radius: 1,
+        });
+
+        drawNoseCheekGuides(ctx, w, h, res.faceLandmarks[0]);
+      }
+
+      // AUTO CALL Lambda when stable conditions
+      const lightingOk = light >= LIGHTING_OK_THRESHOLD;
+      const faceOk = numFaces > 0;
+
+      if (running && lightingOk && faceOk) {
+        const t = Date.now();
+        if (t - lastAutoCallRef.current >= AUTO_CALL_MS) {
+          lastAutoCallRef.current = t;
+          // don’t await to keep loop smooth
+          callLambdaWithCurrentFrame();
+        }
+      }
+    }
+
+    rafRef.current = requestAnimationFrame(loop);
   }
 
-  const label = (v) => {
-    if (v >= 75) return "High";
-    if (v >= 45) return "Medium";
-    if (v > 0) return "Low";
-    return "—";
-  };
+  // Manual analyze button
+  async function analyzeNow() {
+    await callLambdaWithCurrentFrame();
+  }
+
+  const lightingOkLabel = lighting >= LIGHTING_OK_THRESHOLD ? "OK" : "Too dark";
 
   return (
-    <div style={{ padding: 16, fontFamily: "Arial, sans-serif" }}>
-      <h1 style={{ marginTop: 0 }}>SkinScan (MVP)</h1>
+    <div className="app">
+      <h1>SkinScan (MVP)</h1>
 
-      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-        <button onClick={startCamera} style={{ padding: "10px 14px" }}>
-          Start Scan
-        </button>
-        <button onClick={stopAll} style={{ padding: "10px 14px" }}>
-          Stop
-        </button>
+      <div className="topRow">
+        <button onClick={startScan} disabled={running}>Start Scan</button>
+        <button onClick={stopScan} disabled={!running}>Stop</button>
+        <button onClick={analyzeNow} disabled={!running}>Analyze Now</button>
 
-        <button
-          onClick={runInferenceNow}
-          style={{ padding: "10px 14px" }}
-          disabled={status !== "Running"}
-          title={status !== "Running" ? "Start camera first" : "Run one-shot inference"}
-        >
-          Analyze Now
-        </button>
-
-        <div>
-          <div>
-            <b>Status:</b> {status}
-          </div>
-          <div>
-            <b>Faces:</b> {faces}
-          </div>
+        <div className="statusBlock">
+          <div><b>Status:</b> {running ? "Running" : "Stopped"}</div>
+          <div><b>Faces:</b> {faces}</div>
         </div>
       </div>
 
-      <div style={{ display: "flex", gap: 12, marginTop: 12, flexWrap: "wrap" }}>
-        <ScoreCard title="Lighting" value={scores.lighting} note={scores.lighting < 35 ? "Too dark" : "OK"} />
-        <ScoreCard title="Redness" value={scores.redness} note={label(scores.redness)} />
-        <ScoreCard title="Shine/Oil" value={scores.shine} note={label(scores.shine)} />
-      </div>
+      <div className="grid">
+        <Card title="Lighting" value={lighting} sub={lightingOkLabel} />
+        <Card title="Redness" value={0} sub="—" />
+        <Card title="Shine/Oil" value={0} sub="—" />
 
-      <div style={{ display: "flex", gap: 12, marginTop: 12, flexWrap: "wrap" }}>
-        <ScoreCard title="ML Status" value={mlStatus} note={ML_URL ? "Lambda wired ✅" : "Missing REACT_APP_ML_URL"} />
-        <ScoreCard
-          title="Acne"
-          value={mlResult?.acne ?? "—"}
-          note={mlResult ? "from Lambda" : "no result yet"}
-        />
-        <ScoreCard
-          title="Dryness"
-          value={mlResult?.dryness ?? "—"}
-          note={mlResult ? "from Lambda" : "no result yet"}
-        />
-        <ScoreCard
-          title="ML Redness"
-          value={mlResult?.redness ?? "—"}
-          note={mlResult ? "from Lambda" : "no result yet"}
-        />
-      </div>
-
-      {mlError ? (
-        <div style={{ marginTop: 10, color: "#b00020", whiteSpace: "pre-wrap" }}>
-          <b>ML error:</b> {mlError}
+        <div className="card">
+          <div className="cardTitle">ML Status</div>
+          <div className="cardValue" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span>{mlStatus}</span>
+            <span>{mlStatus === "Done" ? "✅" : mlStatus === "Failed" ? "❌" : ""}</span>
+          </div>
+          <div className="cardSub">
+            Lambda wired {ML_URL ? "✅" : "❌"}
+          </div>
         </div>
-      ) : null}
 
-      <div style={{ marginTop: 16, position: "relative", maxWidth: 520 }}>
-        <video
-          ref={videoRef}
-          playsInline
-          muted
-          style={{
-            width: "100%",
-            borderRadius: 18,
-            background: "#000",
-            transform: "scaleX(-1)", // selfie mirror for UX
-          }}
-        />
-        <canvas
-          ref={overlayRef}
-          style={{
-            position: "absolute",
-            left: 0,
-            top: 0,
-            width: "100%",
-            height: "100%",
-            pointerEvents: "none",
-            transform: "scaleX(-1)", // match mirrored video
-          }}
-        />
+        <Card title="Acne" value={acneValue} sub={acneValue === "—" ? "no result yet" : "from Lambda"} />
+        <Card title="Dryness" value={drynessValue} sub={drynessValue === "—" ? "no result yet" : "from Lambda"} />
+        <Card title="ML Redness" value={mlRednessValue} sub={mlRednessValue === "—" ? "no result yet" : "from Lambda"} />
       </div>
 
-      <p style={{ color: "#666", marginTop: 12 }}>
+      {mlError ? <div className="error">ML error: {mlError}</div> : null}
+      {debug ? <div className="debug">{debug}</div> : null}
+
+      <div className="videoWrap">
+        <video ref={videoRef} className="video" playsInline muted />
+        <canvas ref={overlayRef} className="overlay" />
+      </div>
+
+      <div className="tip">
         Tip: Use bright, even lighting. Avoid backlight. Keep your face centered.
         <br />
         Live mode: when lighting is OK and a face is detected, the app auto-calls Lambda every ~2.5s.
-      </p>
-
-      <pre
-        style={{
-          background: "#f5f5f5",
-          padding: 10,
-          borderRadius: 10,
-          fontSize: 12,
-          overflowX: "auto",
-        }}
-      >
-        {debug}
-      </pre>
+      </div>
     </div>
   );
 }
-
-function ScoreCard({ title, value, note }) {
-  return (
-    <div style={{ border: "1px solid #333", borderRadius: 12, padding: 12, minWidth: 160 }}>
-      <div style={{ fontSize: 14, opacity: 0.8 }}>{title}</div>
-      <div style={{ fontSize: 28, fontWeight: 700 }}>{String(value)}</div>
-      <div style={{ fontSize: 13, opacity: 0.8 }}>{note}</div>
-    </div>
-  );
-}
-
-/** ---------- helpers ---------- **/
-
-function toPx(p, w, h) {
-  return { x: p.x * w, y: p.y * h };
-}
-function polyFrom(lm, idxs, w, h) {
-  return idxs.map((i) => toPx(lm[i], w, h));
-}
-function drawPoly(ctx, poly, fillStyle) {
-  if (!poly || poly.length < 3) return;
-  ctx.save();
-  ctx.beginPath();
-  ctx.moveTo(poly[0].x, poly[0].y);
-  for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i].x, poly[i].y);
-  ctx.closePath();
-  ctx.fillStyle = fillStyle;
-  ctx.fill();
-  ctx.restore();
-}
-function drawHUD(ctx, { lighting, redness, shine, lightingOk }) {
-  ctx.save();
-  ctx.fillStyle = "rgba(0,0,0,0.55)";
-  ctx.fillRect(12, 12, 310, 92);
-  ctx.fillStyle = "white";
-  ctx.font = "14px sans-serif";
-  ctx.fillText(`Lighting: ${Math.round(lighting)} ${lightingOk ? "" : "(too dark)"}`, 22, 36);
-  ctx.fillText(`Redness: ${Math.round(redness)}`, 22, 58);
-  ctx.fillText(`Shine: ${Math.round(shine)}`, 22, 80);
-  ctx.restore();
-}
-
-// Sample pixels from multiple polys, cheaply (bounding box + stride + point-in-poly)
-function samplePolys(ctx, polys, maxSamples = 3000) {
-  const pts = polys.flat();
-  if (pts.length < 3) return [];
-
-  let minX = Infinity,
-    minY = Infinity,
-    maxX = -Infinity,
-    maxY = -Infinity;
-  for (const p of pts) {
-    minX = Math.min(minX, p.x);
-    minY = Math.min(minY, p.y);
-    maxX = Math.max(maxX, p.x);
-    maxY = Math.max(maxY, p.y);
-  }
-  minX = Math.max(0, Math.floor(minX));
-  minY = Math.max(0, Math.floor(minY));
-  maxX = Math.min(ctx.canvas.width - 1, Math.ceil(maxX));
-  maxY = Math.min(ctx.canvas.height - 1, Math.ceil(maxY));
-
-  const w = maxX - minX + 1;
-  const h = maxY - minY + 1;
-  if (w <= 2 || h <= 2) return [];
-
-  const img = ctx.getImageData(minX, minY, w, h).data;
-
-  const totalPixels = w * h;
-  const step = Math.max(1, Math.floor(Math.sqrt(totalPixels / maxSamples)));
-
-  const out = [];
-  for (let y = 0; y < h; y += step) {
-    for (let x = 0; x < w; x += step) {
-      const px = minX + x;
-      const py = minY + y;
-
-      // inside ANY of the polys
-      let inside = false;
-      for (const poly of polys) {
-        if (pointInPoly({ x: px, y: py }, poly)) {
-          inside = true;
-          break;
-        }
-      }
-      if (!inside) continue;
-
-      const i = (y * w + x) * 4;
-      out.push([img[i], img[i + 1], img[i + 2]]); // RGB
-    }
-  }
-  return out;
-}
-
-function lightingQualityFromPolys(ctx, polys) {
-  const rgb = samplePolys(ctx, polys, 2500);
-  if (rgb.length < 80) return 0;
-
-  let sumY = 0,
-    sumY2 = 0;
-  for (const [r, g, b] of rgb) {
-    const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    sumY += y;
-    sumY2 += y * y;
-  }
-  const mean = sumY / rgb.length;
-  const variance = sumY2 / rgb.length - mean * mean;
-  const std = Math.sqrt(Math.max(0, variance));
-
-  const meanScore = clamp((mean / 255) * 100, 0, 100);
-  const contrastScore = clamp((std / 64) * 100, 0, 100);
-  return clamp(0.75 * meanScore + 0.25 * contrastScore, 0, 100);
-}
-
-function rednessFromPolys(ctx, polys) {
-  const rgb = samplePolys(ctx, polys, 2500);
-  if (rgb.length < 80) return 0;
-
-  let acc = 0;
-  for (const [r, g, b] of rgb) {
-    const gb = (g + b) / 2;
-    acc += r - gb; // redness proxy
-  }
-  const mean = acc / rgb.length; // range roughly [-255, 255]
-  // map to 0-100 (tune constants as needed)
-  return clamp(((mean + 20) / 120) * 100, 0, 100);
-}
-
-function shineFromPolys(ctx, polys) {
-  const rgb = samplePolys(ctx, polys, 2500);
-  if (rgb.length < 80) return 0;
-
-  // Shine proxy: high brightness but low colorfulness (specular highlights)
-  let shiny = 0;
-  for (const [r, g, b] of rgb) {
-    const maxc = Math.max(r, g, b);
-    const minc = Math.min(r, g, b);
-    const v = maxc; // value-ish
-    const sat = maxc === 0 ? 0 : (maxc - minc) / maxc; // 0..1
-
-    if (v > 210 && sat < 0.35) shiny++;
-  }
-  const frac = shiny / rgb.length; // 0..1
-  return clamp(frac * 250, 0, 100);
-}
-
-function pointInPoly(pt, poly) {
-  // ray-casting
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const xi = poly[i].x,
-      yi = poly[i].y;
-    const xj = poly[j].x,
-      yj = poly[j].y;
-
-    const intersect =
-      yi > pt.y !== yj > pt.y &&
-      pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi + 1e-9) + xi;
-    if (intersect) inside = !inside;
-  }
-  return inside;
-}
-
-function clamp(v, a, b) {
-  return Math.max(a, Math.min(b, v));
-}
-
-
-
