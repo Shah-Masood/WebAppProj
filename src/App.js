@@ -431,7 +431,7 @@ export default function App() {
       </div>
 
       <div style={{ display: "flex", gap: 12, marginTop: 12, flexWrap: "wrap" }}>
-        <ScoreCard title="ML Status" value={mlStatus} note={ML_URL ? "Lambda wired ✅" : "Missing REACT_APP_ML_URL"} />
+        <ScoreCard title="ML Status" value={mlStatus} note={ML_URL ? "Lambda wired" : "Missing REACT_APP_ML_URL"} />
         <ScoreCard title="Acne" value={acneValue} note={mlResult ? "from Lambda" : "no result yet"} />
         <ScoreCard title="Dryness" value={drynessValue} note={mlResult ? "from Lambda" : "no result yet"} />
         <ScoreCard title="ML Redness" value={rednessMlValue} note={mlResult ? "from Lambda" : "no result yet"} />
@@ -655,6 +655,7 @@ function pointInPoly(pt, poly) {
 function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
+
 
 
 
