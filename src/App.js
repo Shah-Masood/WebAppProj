@@ -295,7 +295,25 @@ export default function App() {
 
       setMlStatus("Inferring…");
       const data = await callMlLambda(img);
-
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `Lambda failed (${res.status})`);
+      }
+      
+      // show acne numbers (binary model)
+      if (typeof data.acne_prob === "number") {
+        setAcne(Math.round(data.acne_prob * 100)); // e.g., 63
+      } else if (typeof data.acne_class === "number") {
+        setAcne(data.acne_class); // fallback for multiclass
+      } else {
+        setAcne(null);
+      }
+      
+      // you don't have these from the model yet, so keep them null/placeholder
+      setDryness(null);
+      setMlRedness(null);
+      
+      setMlStatus("done");
+      setMlError("");
       setMlResult(data);
       setMlStatus("Done ✅");
     } catch (e) {
@@ -619,5 +637,6 @@ function pointInPoly(pt, poly) {
 function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
+
 
 
