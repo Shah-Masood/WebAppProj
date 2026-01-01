@@ -100,7 +100,7 @@ export default function App() {
 
         if (cancelled) return;
         landmarkerRef.current = landmarker;
-        setDebug("FaceLandmarker loaded ✅");
+        setDebug("FaceLandmarker loaded");
       } catch (e) {
         console.error(e);
         setDebug(`FaceLandmarker load failed: ${e?.message || String(e)}`);
@@ -137,7 +137,7 @@ export default function App() {
       });
 
       await video.play();
-      setDebug(`Video ready ✅ (${video.videoWidth}x${video.videoHeight})`);
+      setDebug(`Video ready (${video.videoWidth}x${video.videoHeight})`);
       setStatus("Running");
       runLoop();
     } catch (e) {
@@ -341,7 +341,7 @@ export default function App() {
       const data = await callMlLambda(img);
 
       setMlResult(data);
-      setMlStatus("Done ✅");
+      setMlStatus("Done");
     } catch (e) {
       console.error(e);
       setMlStatus("Failed ❌");
@@ -371,7 +371,7 @@ export default function App() {
     callMlLambda(img)
       .then((data) => {
         setMlResult(data);
-        setMlStatus("Live ✅");
+        setMlStatus("Live");
       })
       .catch((e) => {
         setMlStatus("Live error ❌");
@@ -655,5 +655,6 @@ function pointInPoly(pt, poly) {
 function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
+
 
 
