@@ -205,6 +205,10 @@ export default function App() {
         } else {
           clearOverlay();
           setScores({ lighting: 0, redness: 0, shine: 0 });
+          
+          setMlResult(null);
+          setMlStatus("Idle");
+          setMlError("");
         }
       }
       rafRef.current = requestAnimationFrame(step);
@@ -651,4 +655,5 @@ function pointInPoly(pt, poly) {
 function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
+
 
